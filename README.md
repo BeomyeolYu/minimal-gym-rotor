@@ -4,6 +4,7 @@ Minimal OpenAI Gym-based environments for a quadrotor UAV
 ### ***Learn by Doing***
 
 This repository contains OpenAI Gym-based environments for low-level control of quadrotor unmanned aerial vehicles. 
+PyTorch implementations of DDPG and TD3 with ``gym-rotor`` can be found in [this repo](https://github.com/fdcl-gwu/gym-rotor).
 To better understand **What Deep RL Do**, see [OpenAI Spinning UP](https://spinningup.openai.com/en/latest/index.html).
 Please feel free to create new issues or pull requests for any suggestions and corrections. 
 
@@ -19,7 +20,7 @@ conda install -c conda-forge gym
 conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch 
 conda install -c conda-forge vpython
 ```
-Check out [Gym](https://anaconda.org/conda-forge/gym), [Pytorch](https://pytorch.org/), and [Vpython](https://anaconda.org/conda-forge/vpython).
+> Check out [Gym](https://anaconda.org/conda-forge/gym), [Pytorch](https://pytorch.org/), and [Vpython](https://anaconda.org/conda-forge/vpython).
 
 2. Clone the repositroy.
 ```bash
@@ -28,7 +29,7 @@ git clone https://github.com/BeomyeolYu/minimal-gym-rotor.git
 
 
 ## TODO:
-- [ ] Update in README.md
+- [ ] Update README.md
 - [ ] Tensorboard
 - [ ] Gym Wrappers
 - [ ] Evaluate un/pre-trained policy
