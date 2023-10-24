@@ -2,38 +2,40 @@
 Minimal OpenAI Gym-based Environment for Quadrotor UAV
 """
 
-import gym
-import gym_rotor
-import numpy as np
+import gymnasium as gym  # import gymnasium library for Gym environments.
+import gym_rotor  # import your custom environment.
 
 if __name__ == "__main__":
 
-    # OpenAI gym environment:
-    env = gym.make('Quad-v0') 
+    # Make OpenAI Gym environment:
+    env = gym.make('Quad-v0', render_mode="human")
 
     # Initialize environment:
-    state = env.reset()
-    done = False
-    total_reward = 0
+    state = env.reset()  # reset the environment and obtain the initial state.
+    done = False  # set done flag to False.
+    total_reward = 0.  # Initialize the total reward.
+    total_timesteps = 0  # Initialize the total steps
 
-    # Training loop.
+    # Training loop:
     while not done:
-        # Select action randomly:
-        action = env.action_space.sample() 
+        total_timesteps += 1
 
-        # Perform action:
-        next_state, reward, done, _ = env.step(action)
-        total_reward += reward
+        # Select action randomly from the action space:
+        action = env.action_space.sample()  # TODO: This line should be replaced with your RL algos.
+
+        # Take the action in the environment, observe next state, reward, and done flag:
+        next_state, reward, done, _, _ = env.step(action)  # perform action.
+        total_reward += reward  # accumulate the reward.
 
         # Visualization:
-        env.render()
+        env.render()  # render the current state of the environment (if rendering is enabled).
 
-        if done: 
-            print(f"Total Reward: {total_reward:.3f}")
+        if done:  # when the episode is complete,
+            # Display the total accumulated reward:
+            print(f"Total timestpes: {total_timesteps+1}, total Reward: {total_reward:.3f}")
 
-            # Reset environment and total reward.
-            state = env.reset() 
-            #done = False
+            # Reset environment and total reward:
+            state, done = env.reset(), False
             total_reward = 0 
 
     # Close environment:

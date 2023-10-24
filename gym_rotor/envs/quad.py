@@ -1,80 +1,107 @@
-import gym
-from gym import spaces
-from gym.utils import seeding
-
 import numpy as np
-from numpy import linalg
+from numpy import clip 
+from numpy import interp
+from numpy.linalg import norm
 from numpy.linalg import inv
+from numpy.random import uniform 
 from math import cos, sin, atan2, sqrt, pi
 from scipy.integrate import odeint, solve_ivp
+from scipy.spatial.transform import Rotation
+
+import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.utils import seeding
+from gym_rotor.envs.quad_utils import *
+from typing import Optional
+import args_parse
 
 class QuadEnv(gym.Env):
-    metadata = {'render.modes': ['human']}
+    metadata = {"render_modes": ["human"]}
 
-    def __init__(self): 
+    def __init__(self, render_mode: Optional[str] = None): 
+        # Hyperparameters:
+        parser = args_parse.create_parser()
+        args = parser.parse_args()
 
         # Quadrotor parameters:
-        self.m = 1.735 # mass of quad, [kg]
-        self.d = 0.228 # arm length, [m]
-        self.J = np.diag([0.02, 0.02, 0.04]) # inertia matrix of quad, [kg m2]
-        self.C_TQ = 0.0135 # torques and thrusts coefficients
-        self.g = 9.81  # standard gravity
+        self.m = 1.994 # mass of quad, [kg]
+        self.d = 0.23 # arm length, [m]
+        self.J = np.diag([0.022, 0.022, 0.035]) # inertia matrix of quad, [kg m2]
+        self.c_tf = 0.0135 # torque-to-thrust coefficients
+        self.c_tw = 2.2 # thrust-to-weight coefficients
+        self.g = 9.81 # standard gravity
 
         # Force and Moment:
         self.f = self.m * self.g # magnitude of total thrust to overcome  
                                  # gravity and mass (No air resistance), [N]
-        self.f_each = self.m * self.g / 4.0 # thrust magnitude of each motor, [N]
-        self.min_force = 1.0 # minimum thrust of each motor, [N]
-        self.max_force = 2 * self.f_each # maximum thrust of each motor, [N]
-        self.f1 = self.f_each # thrust of each 1st motor, [N]
-        self.f2 = self.f_each # thrust of each 2nd motor, [N]
-        self.f3 = self.f_each # thrust of each 3rd motor, [N]
-        self.f4 = self.f_each # thrust of each 4th motor, [N]
+        self.hover_force = self.m * self.g / 4.0 # thrust magnitude of each motor, [N]
+        self.min_force = 0.5 # minimum thrust of each motor, [N]
+        self.max_force = self.c_tw * self.hover_force # maximum thrust of each motor, [N]
+        self.avrg_act = (self.min_force+self.max_force)/2.0 
+        self.scale_act = self.max_force-self.avrg_act # actor scaling
 
+        self.f1 = self.hover_force # thrust of each 1st motor, [N]
+        self.f2 = self.hover_force # thrust of each 2nd motor, [N]
+        self.f3 = self.hover_force # thrust of each 3rd motor, [N]
+        self.f4 = self.hover_force # thrust of each 4th motor, [N]
         self.M  = np.zeros(3) # magnitude of moment on quadrotor, [Nm]
 
+        self.fM = np.zeros((4, 1)) # Force-moment vector
+        self.forces_to_fM = np.array([
+            [1.0, 1.0, 1.0, 1.0],
+            [0.0, -self.d, 0.0, self.d],
+            [self.d, 0.0, -self.d, 0.0],
+            [-self.c_tf, self.c_tf, -self.c_tf, self.c_tf]
+        ]) # Conversion matrix of forces to force-moment 
+        self.fM_to_forces = np.linalg.inv(self.forces_to_fM)
+
         # Simulation parameters:
-        self.dt = 0.005 # discrete time step, t(2) - t(1), [sec]
+        self.freq = 200 # frequency [Hz]
+        self.dt = 1./self.freq # discrete timestep, t(2) - t(1), [sec]
         self.ode_integrator = "solve_ivp" # or "euler", ODE solvers
         self.R2D = 180/pi # [rad] to [deg]
         self.D2R = pi/180 # [deg] to [rad]
-        self.e3 = np.array([0.0, 0.0, 1.0])[np.newaxis].T 
+        self.e1 = np.array([1.,0.,0.])
+        self.e2 = np.array([0.,1.,0.])
+        self.e3 = np.array([0.,0.,1.])
+
+        # Coefficients in reward function:
+        self.reward_alive = 0. # β ≥ 0 is a bonus value earned by the agent for staying alive
+        self.reward_crash = -1. # Out of boundry or crashed!
+        self.Cx, self.Cv, self.CR, self.CW  = args.Cx, args.Cv, args.CR, args.CW
+        self.reward_min = -np.ceil(self.Cx+self.Cv+self.CR+self.CW)
 
         # Commands:
-        self.xd     = np.array([0.0, 0.0, -2.0]) # desired tracking position command, [m] 
-        self.xd_dot = np.array([0.0, 0.0, 0.0])  # [m/s]
-        self.b1d    = np.array([1.0, 0.0, 0.0])  # desired heading direction        
+        self.xd  = np.array([0.,0.,0.]) # desired tracking position command, [m] 
+        self.vd  = np.array([0.,0.,0.]) # [m/s]
+        self.b1d = np.array([1.,0.,0.]) # desired heading direction        
+        self.Rd  = np.eye(3)
 
-        # limits of states:
-        self.x_max_threshold = 3.0  # [m]
-        self.v_max_threshold = 10.0 # [m/s]
-        self.W_max_threshold = 3.0  # [rad/s]
-        self.euler_max_threshold = 80 * self.D2R # [rad]
-
-        self.limits_x     = np.array([self.x_max_threshold, self.x_max_threshold, self.x_max_threshold]) # [m]
-        self.limits_v     = np.array([self.v_max_threshold, self.v_max_threshold, self.v_max_threshold]) # [m/s]
-        self.limits_R_vec = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-        self.limits_W     = np.array([self.W_max_threshold, self.W_max_threshold, self.W_max_threshold]) # [rad/s]
-
-        self.low = np.concatenate([-self.limits_x,  
-                                   -self.limits_v,
-                                   -self.limits_R_vec,
-                                   -self.limits_W])
-        self.high = np.concatenate([self.limits_x,  
-                                    self.limits_v,
-                                    self.limits_R_vec,
-                                    self.limits_W])
+        # Limits of states:
+        self.x_lim = 3.0 # [m]
+        self.v_lim = 5.0 # [m/s]
+        self.W_lim = 2*pi # [rad/s]
+        self.euler_lim = 85 # [deg]
+        self.low = np.concatenate([-self.x_lim * np.ones(3),  
+                                   -self.v_lim * np.ones(3),
+                                   -np.ones(9),
+                                   -self.W_lim * np.ones(3)])
+        self.high = np.concatenate([self.x_lim * np.ones(3),  
+                                    self.v_lim * np.ones(3),
+                                    np.ones(9),
+                                    self.W_lim * np.ones(3)])
 
         # Observation space:
         self.observation_space = spaces.Box(
-            self.low, 
-            self.high, 
+            low=self.low, 
+            high=self.high, 
             dtype=np.float64
         )
+
         # Action space:
         self.action_space = spaces.Box(
-            low=self.min_force, 
-            high=self.max_force, 
+            low=-1.0, 
+            high=1.0, 
             shape=(4,),
             dtype=np.float64
         ) 
@@ -82,268 +109,300 @@ class QuadEnv(gym.Env):
         # Init:
         self.state = None
         self.viewer = None
-        self.render_quad1  = None
-        self.render_quad2  = None
-        self.render_rotor1 = None
-        self.render_rotor2 = None
-        self.render_rotor3 = None
-        self.render_rotor4 = None
-        self.render_ref = None
-        self.render_force_rotor1 = None
-        self.render_force_rotor2 = None
-        self.render_force_rotor3 = None
-        self.render_force_rotor4 = None
         self.render_index = 1 
-
-        self.seed()
-        self.reset()
 
 
     def step(self, action):
-
-        # Saturated actions:
-        self.f1 = np.clip(action[0], self.min_force, self.max_force) # [N]
-        self.f2 = np.clip(action[1], self.min_force, self.max_force) 
-        self.f3 = np.clip(action[2], self.min_force, self.max_force)
-        self.f4 = np.clip(action[3], self.min_force, self.max_force)
-
-        ForceMoment = np.array([[       1.0,       1.0,        1.0,       1.0],
-                                [       0.0,   -self.d,        0.0,    self.d],
-                                [    self.d,       0.0,    -self.d,       0.0],
-                                [-self.C_TQ, self.C_TQ, -self.C_TQ, self.C_TQ]]) \
-                    @ np.array([self.f1, self.f2, self.f3, self.f4])[np.newaxis].T
-        self.f = ForceMoment[0]   # [N]
-        self.M = ForceMoment[1:4] # [Nm]
+        # Action:
+        action = self.action_wrapper(action)
 
         # States: (x[0:3]; v[3:6]; R_vec[6:15]; W[15:18])
-        _state = (self.state).flatten()
-
-        x = np.array([_state[0], _state[1], _state[2]]).flatten() # [m]
-        v = np.array([_state[3], _state[4], _state[5]]).flatten() # [m/s]
-        R_vec = np.array([_state[6],  _state[7],  _state[8],
-                          _state[9],  _state[10], _state[11],
-                          _state[12], _state[13], _state[14]]).flatten() 
-        R = R_vec.reshape(3, 3, order='F')
-        W = np.array([_state[15], _state[16], _state[17]]).flatten() # [rad/s]
-        _state = np.concatenate((x, v, R_vec, W), axis=0)
-        
-        # Solve ODEs.
-        if self.ode_integrator == "euler": # solve w/ Euler's Method
-            # Equations of motion of the quadrotor UAV
-            x_dot = v
-            v_dot = self.g*self.e3 - self.f*R@self.e3/self.m
-            R_vec_dot = (R@self.hat(W)).reshape(9, 1, order='F')
-            W_dot = inv(self.J)@(-self.hat(W)@self.J@W[np.newaxis].T + self.M)
-            state_dot = np.concatenate([x_dot.flatten(), 
-                                        v_dot.flatten(),                                                                          
-                                        R_vec_dot.flatten(),
-                                        W_dot.flatten()])
-            self.state = _state + state_dot * self.dt
-        elif self.ode_integrator == "solve_ivp": # solve w/ 'solve_ivp' Solver
-            # method= 'RK45', 'LSODA', 'BDF', 'LSODA', ...
-            sol = solve_ivp(self.EoM, [0, self.dt], _state, method='DOP853')
-            self.state = sol.y[:,-1]
-         
-        # Next states:
-        x = np.array([self.state[0], self.state[1], self.state[2]]).flatten() # [m]
-        v = np.array([self.state[3], self.state[4], self.state[5]]).flatten() # [m/s]
-        R_vec = np.array([self.state[6], self.state[7], self.state[8],
-                          self.state[9], self.state[10], self.state[11],
-                          self.state[12], self.state[13], self.state[14]]).flatten()
-        W = np.array([self.state[15], self.state[16], self.state[17]]).flatten() # [rad/s]
-
-        # Re-orthonormalize:
-        ''' https://www.codefull.net/2017/07/orthonormalize-a-rotation-matrix/ '''
-        R = R_vec.reshape(3, 3, order='F')
-        u, s, vh = linalg.svd(R, full_matrices=False)
-        R = u @ vh
-        R_vec = R.reshape(9, 1, order='F').flatten()
-        self.state = np.concatenate((x, v, R_vec, W), axis=0)
+        state = (self.state).flatten()
+                 
+        # Observation:
+        obs = self.observation_wrapper(state)
 
         # Reward function:
-        C_X = 2.0  # pos coef.
-        C_V = 0.15 # vel coef.
-        C_W = 0.2  # ang_vel coef.
-
-        eX = x - self.xd     # position error
-        eX /= self.x_max_threshold # normalization
-        eV = v - self.xd_dot # velocity error
-                    
-        reward = C_X*max(0, 1.0 - linalg.norm(eX, 2)) \
-                - C_V * linalg.norm(eV, 2) - C_W * linalg.norm(W, 2)
-
-        # Convert rotation matrix to Euler angles:
-        eulerAngles = self.rotationMatrixToEulerAngles(R)
+        reward = self.reward_wrapper(obs)
+        reward = interp(reward, [self.reward_min, 0.], [0., 1.]) # linear interpolation [0,1]  
 
         # Terminal condition:
-        done = False
-        done = bool(
-               (abs(x) >= self.limits_x).any() # [m]
-            or x[2] >= 0.0 # crashed
-            or (abs(v) >= self.limits_v).any() # [m/s]
-            or (abs(W) >= self.limits_W).any() # [rad/s]
-            or abs(eulerAngles[0]) >= self.euler_max_threshold # phi
-            or abs(eulerAngles[1]) >= self.euler_max_threshold # theta
-        )
+        done = self.done_wrapper(obs)
+        if done: # Out of boundry or crashed!
+            reward = self.reward_crash
 
-        # Compute the thrust of each motor from the total force and moment
-        ''' 
-        ForceMoment =  (0.25 * np.array([[ 1.0,         0.0,   2.0/self.d, -1.0/self.C_TQ],
-                                         [ 1.0, -2.0/self.d,        0.0,    1.0/self.C_TQ],
-                                         [ 1.0,         0.0,  -2.0/self.d, -1.0/self.C_TQ],
-                                         [ 1.0,  2.0/self.d,        0.0,    1.0/self.C_TQ]])) \
-                    @ np.array([self.f, self.M[0], self.M[1], self.M[2]], dtype=object)[np.newaxis].T
-        self.f1 = ForceMoment[0] # [N]
-        self.f2 = ForceMoment[1]
-        self.f3 = ForceMoment[2]
-        self.f4 = ForceMoment[3]
-        '''
-
-        return np.array(self.state), reward, done, {}
+        return obs, reward, done, False, {}
 
 
-    def reset(self):
-        # Reset states:
-        self.state = np.array(np.zeros(18))
-        self.state[6:15] = np.eye(3).reshape(1,9, order='F')
-        _error = 0.0 # initial error
+    def reset(self, env_type='train',
+        seed: Optional[int] = None,
+        options: Optional[dict] = None,
+    ):
+        super().reset(seed=seed)
+
+        # Reset states & Normalization:
+        state = np.array(np.zeros(18))
+        state[6:15] = np.eye(3).reshape(1, 9, order='F')
+
+        # Initial state error:
+        self.sample_init_error(env_type)
 
         # x, position:
-        self.state[0] = np.random.uniform(size = 1, low = -1.5, high = 1.5) 
-        self.state[1] = np.random.uniform(size = 1, low = -1.5, high = 1.5)  
-        self.state[2] = np.random.uniform(size = 1, low = -0.1, high = -1.5) 
+        state[0:3] = uniform(size=3,low=-self.init_x,high=self.init_x) 
 
         # v, velocity:
-        self.state[3] = np.random.uniform(size = 1, low = -_error, high = _error) 
-        self.state[4] = np.random.uniform(size = 1, low = -_error, high = _error) 
-        self.state[5] = np.random.uniform(size = 1, low = -_error, high = _error)
-
-        # R, attitude:
-        # https://cse.sc.edu/~yiannisr/774/2014/Lectures/15-Quadrotors.pdf
-        phi   = np.random.uniform(size = 1, low = -_error, high = _error)
-        theta = np.random.uniform(size = 1, low = -_error, high = _error)
-        psi   = np.random.uniform(size = 1, low = -_error, high = _error)
-        self.state[6]  = cos(psi)*cos(theta)
-        self.state[7]  = sin(psi)*cos(theta) 
-        self.state[8]  = -sin(theta)  
-        self.state[9]  = cos(psi)*sin(theta)*sin(phi) - sin(psi)*cos(phi) 
-        self.state[10] = sin(psi)*sin(theta)*sin(phi) + cos(psi)*cos(phi)
-        self.state[11] = cos(theta)*sin(phi) 
-        self.state[12] = cos(psi)*sin(theta)*cos(phi) + sin(psi)*sin(phi)
-        self.state[13] = sin(psi)*sin(theta)*cos(phi) - cos(psi)*sin(phi)
-        self.state[14] = cos(theta)*cos(phi)
+        state[3:6] = uniform(size=3,low=-self.init_v,high=self.init_v) 
 
         # W, angular velocity:
-        self.state[15] = np.random.uniform(size = 1, low = -_error, high = _error) 
-        self.state[16] = np.random.uniform(size = 1, low = -_error, high = _error) 
-        self.state[17] = np.random.uniform(size = 1, low = -_error, high = _error) 
+        state[15:18] = uniform(size=3,low=-self.init_W,high=self.init_W) 
+
+        # R, attitude:
+        roll_pitch = uniform(size=2,low=-self.init_R,high=self.init_R)
+        yaw   = uniform(size=1,low=-pi, high=pi) 
+        euler = np.concatenate((roll_pitch, yaw), axis=None)
+        R = Rotation.from_euler('xyz', euler, degrees=False).as_matrix()
+        # Re-orthonormalize:
+        if not isRotationMatrix(R):
+            U, s, VT = psvd(R)
+            R = U @ VT.T
+        R_vec = R.reshape(9, 1, order='F').flatten()
+        
+        # Normalization: [max, min] -> [-1, 1]
+        x_norm, v_norm, _, W_norm = state_normalization(state, self.x_lim, self.v_lim, self.W_lim)
+        self.state = np.concatenate((x_norm, v_norm, R_vec, W_norm), axis=0)
 
         # Reset forces & moments:
         self.f  = self.m * self.g
-        self.f1 = self.f_each
-        self.f2 = self.f_each
-        self.f3 = self.f_each
-        self.f4 = self.f_each
+        self.f1 = self.hover_force
+        self.f2 = self.hover_force
+        self.f3 = self.hover_force
+        self.f4 = self.hover_force
         self.M  = np.zeros(3)
 
         return np.array(self.state)
 
 
+    def action_wrapper(self, action):
+        # Linear scale, [-1, 1] -> [min_act, max_act] 
+        action = (
+            self.scale_act * action + self.avrg_act
+            ).clip(self.min_force, self.max_force)
+
+        # Saturated thrust of each motor:
+        self.f1 = action[0]
+        self.f2 = action[1]
+        self.f3 = action[2]
+        self.f4 = action[3]
+
+        # Convert each forces to force-moment:
+        self.fM = self.forces_to_fM @ action
+        self.f = self.fM[0]   # [N]
+        self.M = self.fM[1:4] # [Nm]  
+
+        return action
+
+
+    def observation_wrapper(self, state):
+        # De-normalization: [-1, 1] -> [max, min]
+        x, v, R, W = state_de_normalization(state, self.x_lim, self.v_lim, self.W_lim)
+        R_vec = R.reshape(9, 1, order='F').flatten()
+        state = np.concatenate((x, v, R_vec, W), axis=0)
+
+        # Solve ODEs:
+        if self.ode_integrator == "euler": # solve w/ Euler's Method
+            # Equations of motion of the quadrotor UAV
+            x_dot = v
+            v_dot = self.g*self.e3 - self.f*R@self.e3/self.m
+            R_vec_dot = (R@hat(W)).reshape(9, 1, order='F')
+            W_dot = inv(self.J)@(-hat(W)@self.J@W + self.M)
+            state_dot = np.concatenate([x_dot.flatten(), 
+                                        v_dot.flatten(),                                                                          
+                                        R_vec_dot.flatten(),
+                                        W_dot.flatten()])
+            self.state = state + state_dot * self.dt
+        elif self.ode_integrator == "solve_ivp": # solve w/ 'solve_ivp' Solver
+            # method = 'RK45', 'DOP853', 'BDF', 'LSODA', ...
+            sol = solve_ivp(self.EoM, [0, self.dt], state, method='DOP853')
+            self.state = sol.y[:,-1]
+
+        # Normalization: [max, min] -> [-1, 1]
+        x_norm, v_norm, R, W_norm = state_normalization(self.state, self.x_lim, self.v_lim, self.W_lim)
+        R_vec = R.reshape(9, 1, order='F').flatten()
+        self.state = np.concatenate((x_norm, v_norm, R_vec, W_norm), axis=0)
+
+        return self.state
+    
+
+    def reward_wrapper(self, obs):
+        # Decomposing state vectors
+        x, v, R, W = state_decomposition(obs)
+
+        # Reward function coefficients:
+        Cx = self.Cx # pos coef.
+        CR = self.CR # att coef.
+        Cv = self.Cv # vel coef.
+        CW = self.CW # ang_vel coef.
+
+        # Errors:
+        eX = x - self.xd # position error
+        eV = v - self.vd # velocity error
+        # Heading errors:
+        eR = ang_btw_two_vectors(get_current_b1(R), self.b1d) # [rad]
+
+        # Reward function:
+        reward_eX = -Cx*(norm(eX, 2)**2) 
+        reward_eV = -Cv*(norm(eV, 2)**2)
+        reward_eR = -CR*(eR/pi) # [0., pi] -> [0., 1.0]
+        reward_eW = -CW*(norm(W, 2)**2)
+
+        reward = self.reward_alive + (reward_eX + reward_eR + reward_eV + reward_eW)
+
+        return reward
+
+
+    def done_wrapper(self, obs):
+        # Decomposing state vectors
+        x, v, R, W = state_decomposition(obs)
+
+        # Convert rotation matrix to Euler angles:
+        euler = Rotation.from_matrix(R).as_euler('xyz', degrees=True)
+
+        done = False
+        done = bool(
+               (abs(x) >= 1.0).any() # [m]
+            or (abs(v) >= 1.0).any() # [m/s]
+            or (abs(W) >= 1.0).any() # [rad/s]
+            or abs(euler[0]) >= self.euler_lim # phi
+            or abs(euler[1]) >= self.euler_lim # theta
+        )
+
+        return done
+
+
+    # https://youtu.be/iS5JFuopQsA
+    def EoM(self, t, state):
+        # Decomposing state vectors
+        x, v, R, W = state_decomposition(state)
+
+        # Equations of motion of the quadrotor UAV
+        x_dot = v
+        v_dot = self.g*self.e3 - self.f*R@self.e3/self.m
+        R_vec_dot = (R@hat(W)).reshape(1, 9, order='F')
+        W_dot = inv(self.J)@(-hat(W)@self.J@W + self.M)
+        state_dot = np.concatenate([x_dot.flatten(), 
+                                    v_dot.flatten(),                                                                          
+                                    R_vec_dot.flatten(),
+                                    W_dot.flatten()])
+
+        return np.array(state_dot)
+
+
+    def sample_init_error(self, env_type='train'):
+        if env_type == 'train':
+            self.init_x = self.x_lim - 0.5 # minus 0.5m
+            self.init_v = self.v_lim*0.5 # 50%; initial vel error, [m/s]
+            self.init_R = 50 * self.D2R  # ±50 deg 
+            self.init_W = self.W_lim*0.5 # 50%; initial ang vel error, [rad/s]
+        elif env_type == 'eval':
+            self.init_x = 0.3 # initial pos error,[m]
+            self.init_v = self.v_lim*0.1 # 10%; initial vel error, [m/s]
+            self.init_R = 10 * self.D2R  # ±10 deg 
+            self.init_W = self.W_lim*0.1 # 10%; initial ang vel error, [rad/s]
+
+
     def render(self, mode='human', close=False):
-        from vpython import box, sphere, color, vector, rate, canvas, cylinder, ring, arrow, scene, textures
+        from vpython import canvas, vector, box, sphere, color, rate, cylinder, arrow, ring, scene, textures
 
         # Rendering state:
-        state_vis = (self.state).flatten()
+        state_vis = np.copy(self.state)
 
-        x = np.array([state_vis[0], state_vis[1], state_vis[2]]).flatten() # [m]
-        v = np.array([state_vis[3], state_vis[4], state_vis[5]]).flatten() # [m/s]
-        R_vec = np.array([state_vis[6], state_vis[7], state_vis[8],
-                          state_vis[9], state_vis[10], state_vis[11],
-                          state_vis[12], state_vis[13], state_vis[14]]).flatten()
-        W = np.array([state_vis[15], state_vis[16], state_vis[17]]).flatten() # [rad/s]
+        # De-normalization state vectors
+        x, v, R, W = state_de_normalization(state_vis, self.x_lim, self.v_lim, self.W_lim)
 
+        # Quadrotor and goal positions:
         quad_pos = x # [m]
         cmd_pos  = self.xd # [m]
 
         # Axis:
-        x_axis = np.array([state_vis[6], state_vis[7], state_vis[8]]).flatten()
-        y_axis = np.array([state_vis[9], state_vis[10], state_vis[11]]).flatten()
-        z_axis = np.array([state_vis[12], state_vis[13], state_vis[14]]).flatten()
+        x_axis = np.array([state_vis[6], state_vis[7], state_vis[8]])
+        y_axis = np.array([state_vis[9], state_vis[10], state_vis[11]])
+        z_axis = np.array([state_vis[12], state_vis[13], state_vis[14]])
 
         # Init:
         if self.viewer is None:
             # Canvas.
-            self.viewer = canvas(title = 'Quadrotor with RL', width = 1024, height = 768, \
-                                 center = vector(0, 0, cmd_pos[2]), background = color.white, \
-                                 forward = vector(1, 0.3, 0.3), up = vector(0, 0, -1)) # forward = view point
+            self.viewer = canvas(title='Quadrotor with RL', width=1024, height=768, \
+                                 center=vector(0, 0, cmd_pos[2]), background=color.white, \
+                                 forward=vector(1, 0.3, 0.3), up=vector(0, 0, -1)) # forward = view point
             
             # Quad body.
-            self.render_quad1 = box(canvas = self.viewer, pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                    axis = vector(x_axis[0], x_axis[1], x_axis[2]), \
-                                    length = 0.2, height = 0.05, width = 0.05) # vector(quad_pos[0], quad_pos[1], 0)
-            self.render_quad2 = box(canvas = self.viewer, pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                    axis = vector(y_axis[0], y_axis[1], y_axis[2]), \
-                                    length = 0.2, height = 0.05, width = 0.05)
+            self.render_quad1 = box(canvas=self.viewer, pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                    axis=vector(x_axis[0], x_axis[1], x_axis[2]), \
+                                    length=0.2, height=0.05, width=0.05) # vector(quad_pos[0], quad_pos[1], 0)
+            self.render_quad2 = box(canvas=self.viewer, pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                    axis=vector(y_axis[0], y_axis[1], y_axis[2]), \
+                                    length=0.2, height=0.05, width=0.05)
             # Rotors.
             rotors_offest = 0.02
-            self.render_rotor1 = cylinder(canvas = self.viewer, pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                          axis = vector(rotors_offest*z_axis[0], rotors_offest*z_axis[1], rotors_offest*z_axis[2]), \
-                                          radius = 0.2, color = color.blue, opacity = 0.5)
-            self.render_rotor2 = cylinder(canvas = self.viewer, pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                          axis = vector(rotors_offest*z_axis[0], rotors_offest*z_axis[1], rotors_offest*z_axis[2]), \
-                                          radius = 0.2, color = color.cyan, opacity = 0.5)
-            self.render_rotor3 = cylinder(canvas = self.viewer, pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                          axis = vector(rotors_offest*z_axis[0], rotors_offest*z_axis[1], rotors_offest*z_axis[2]), \
-                                          radius = 0.2, color = color.blue, opacity = 0.5)
-            self.render_rotor4 = cylinder(canvas = self.viewer, pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                          axis = vector(rotors_offest*z_axis[0], rotors_offest*z_axis[1], rotors_offest*z_axis[2]), \
-                                          radius = 0.2, color = color.cyan, opacity = 0.5)
+            self.render_rotor1 = cylinder(canvas=self.viewer, pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                          axis=vector(rotors_offest*z_axis[0], rotors_offest*z_axis[1], rotors_offest*z_axis[2]), \
+                                          radius=0.2, color=color.blue, opacity=0.5)
+            self.render_rotor2 = cylinder(canvas=self.viewer, pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                          axis=vector(rotors_offest*z_axis[0], rotors_offest*z_axis[1], rotors_offest*z_axis[2]), \
+                                          radius=0.2, color=color.cyan, opacity=0.5)
+            self.render_rotor3 = cylinder(canvas=self.viewer, pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                          axis=vector(rotors_offest*z_axis[0], rotors_offest*z_axis[1], rotors_offest*z_axis[2]), \
+                                          radius=0.2, color=color.blue, opacity=0.5)
+            self.render_rotor4 = cylinder(canvas=self.viewer, pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                          axis=vector(rotors_offest*z_axis[0], rotors_offest*z_axis[1], rotors_offest*z_axis[2]), \
+                                          radius=0.2, color=color.cyan, opacity=0.5)
 
             # Force arrows.
-            self.render_force_rotor1 = arrow(pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                             axis = vector(z_axis[0], z_axis[1], z_axis[2]), \
-                                             shaftwidth = 0.05, color = color.blue)
-            self.render_force_rotor2 = arrow(pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                             axis = vector(z_axis[0], z_axis[1], z_axis[2]), \
-                                             shaftwidth = 0.05, color = color.cyan)
-            self.render_force_rotor3 = arrow(pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                             axis = vector(z_axis[0], z_axis[1], z_axis[2]), \
-                                             shaftwidth = 0.05, color = color.blue)
-            self.render_force_rotor4 = arrow(pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                             axis = vector(z_axis[0], z_axis[1], z_axis[2]), \
-                                             shaftwidth = 0.05, color = color.cyan)
+            self.render_force_rotor1 = arrow(pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                             axis=vector(z_axis[0], z_axis[1], z_axis[2]), \
+                                             shaftwidth=0.05, color=color.blue)
+            self.render_force_rotor2 = arrow(pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                             axis=vector(z_axis[0], z_axis[1], z_axis[2]), \
+                                             shaftwidth=0.05, color=color.cyan)
+            self.render_force_rotor3 = arrow(pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                             axis=vector(z_axis[0], z_axis[1], z_axis[2]), \
+                                             shaftwidth=0.05, color=color.blue)
+            self.render_force_rotor4 = arrow(pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                             axis=vector(z_axis[0], z_axis[1], z_axis[2]), \
+                                             shaftwidth=0.05, color=color.cyan)
                                     
             # Commands.
-            self.render_ref = sphere(canvas = self.viewer, pos = vector(cmd_pos[0], cmd_pos[1], cmd_pos[2]), \
-                                     radius = 0.07, color = color.red, \
-                                     make_trail = True, trail_type = 'points', interval = 50)									
+            self.render_ref = sphere(canvas=self.viewer, pos=vector(cmd_pos[0], cmd_pos[1], cmd_pos[2]), \
+                                     radius=0.07, color=color.red, \
+                                     make_trail=True, trail_type='points', interval=50)									
             
             # Inertial axis.				
-            self.e1_axis = arrow(pos = vector(2.5, -2.5, 0), axis = 0.5*vector(1, 0, 0), \
-                                 shaftwidth = 0.04, color=color.blue)
-            self.e2_axis = arrow(pos = vector(2.5, -2.5, 0), axis = 0.5*vector(0, 1, 0), \
-                                 shaftwidth = 0.04, color=color.green)
-            self.e3_axis = arrow(pos = vector(2.5, -2.5, 0), axis = 0.5*vector(0, 0, 1), \
-                                 shaftwidth = 0.04, color=color.red)
+            self.e1_axis = arrow(pos=vector(2.5, -2.5, 0), axis=0.5*vector(1, 0, 0), \
+                                 shaftwidth=0.04, color=color.blue)
+            self.e2_axis = arrow(pos=vector(2.5, -2.5, 0), axis=0.5*vector(0, 1, 0), \
+                                 shaftwidth=0.04, color=color.green)
+            self.e3_axis = arrow(pos=vector(2.5, -2.5, 0), axis=0.5*vector(0, 0, 1), \
+                                 shaftwidth=0.04, color=color.red)
 
             # Body axis.				
-            self.render_b1_axis = arrow(canvas = self.viewer, 
-                                        pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                        axis = vector(x_axis[0], x_axis[1], x_axis[2]), \
-                                        shaftwidth = 0.02, color = color.blue,
-                                        make_trail = True, trail_color = color.yellow)
-            self.render_b2_axis = arrow(canvas = self.viewer, 
-                                        pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                        axis = vector(y_axis[0], y_axis[1], y_axis[2]), \
-                                        shaftwidth = 0.02, color = color.green)
-            self.render_b3_axis = arrow(canvas = self.viewer, 
-                                        pos = vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
-                                        axis = vector(z_axis[0], z_axis[1], z_axis[2]), \
-                                        shaftwidth = 0.02, color = color.red)
+            self.render_b1_axis = arrow(canvas=self.viewer, 
+                                        pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                        axis=vector(x_axis[0], x_axis[1], x_axis[2]), \
+                                        shaftwidth=0.02, color=color.blue, \
+                                        make_trail=True, retain=60, interval=10, \
+                                        trail_type='points', trail_radius=0.03, trail_color=color.yellow)
+            self.render_b2_axis = arrow(canvas=self.viewer, 
+                                        pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                        axis=vector(y_axis[0], y_axis[1], y_axis[2]), \
+                                        shaftwidth=0.02, color=color.green)
+            self.render_b3_axis = arrow(canvas=self.viewer, 
+                                        pos=vector(quad_pos[0], quad_pos[1], quad_pos[2]), \
+                                        axis=vector(z_axis[0], z_axis[1], z_axis[2]), \
+                                        shaftwidth=0.02, color=color.red)
 
             # Floor.
-            self.render_floor = box(pos = vector(0,0,0),size = vector(5,5,0.05), axis = vector(1,0,0), \
-                                    opacity = 0.2, color = color.black)
+            self.render_floor = box(pos=vector(0,0,0),size=vector(5,5,0.05), axis=vector(1,0,0), \
+                                    opacity=0.2, color=color.black)
 
 
         # Update visualization component:
@@ -483,7 +542,7 @@ class QuadEnv(gym.Env):
         self.render_index += 1        
         """
 
-        rate(30) # FPS
+        rate(100) # FPS
 
         return True
 
@@ -491,100 +550,3 @@ class QuadEnv(gym.Env):
     def close(self):
         if self.viewer:
             self.viewer = None
-
-
-    def seed(self, seed=None):
-        self.np_random, seed = seeding.np_random(seed)
-        return [seed]
-
-
-    def EoM(self, t, state):
-        # https://youtu.be/iS5JFuopQsA
-        x = np.array([state[0], state[1], state[2]]).flatten() # [m]
-        v = np.array([state[3], state[4], state[5]]).flatten() # [m/s]
-        R_vec = np.array([state[6], state[7], state[8],
-                          state[9], state[10], state[11],
-                          state[12], state[13], state[14]]).flatten()
-        R = R_vec.reshape(3, 3, order='F')
-        W = np.array([state[15], state[16], state[17]]).flatten() # [rad/s]
-
-        # Equations of motion of the quadrotor UAV
-        x_dot = v
-        v_dot = self.g*self.e3 - self.f*R@self.e3/self.m
-        R_vec_dot = (R@self.hat(W)).reshape(9, 1, order='F')
-        W_dot = inv(self.J)@(-self.hat(W)@self.J@W[np.newaxis].T + self.M)
-
-        state_dot = np.concatenate([x_dot.flatten(), 
-                                    v_dot.flatten(),                                                                          
-                                    R_vec_dot.flatten(),
-                                    W_dot.flatten()])
-
-        return np.array(state_dot)
-
-
-    def hat(self, x):
-        hat_x = np.array([[0.0, -x[2], x[1]], \
-                          [x[2], 0.0, -x[0]], \
-                          [-x[1], x[0], 0.0]])
-                        
-        return np.array(hat_x)
-
-
-    def vee(self, M):
-        # vee map: inverse of the hat map
-        vee_M = np.array([[M[2,1]], \
-                          [M[0,2]], \
-                          [M[1,0]]])
-
-        return np.array(vee_M)
-
-
-    def eulerAnglesToRotationMatrix(self, theta) :
-        # Calculates Rotation Matrix given euler angles.
-        R_x = np.array([[1,              0,               0],
-                        [0,  cos(theta[0]),  -sin(theta[0])],
-                        [0,  sin(theta[0]),   cos(theta[0])]])
-
-        R_y = np.array([[ cos(theta[1]),   0,  sin(theta[1])],
-                        [             0,   1,              0],
-                        [-sin(theta[1]),   0,  cos(theta[1])]])
-
-        R_z = np.array([[cos(theta[2]),  -sin(theta[2]),  0],
-                        [sin(theta[2]),   cos(theta[2]),  0],
-                        [            0,               0,  1]])
-
-        R = np.dot(R_z, np.dot( R_y, R_x ))
-
-        return R
-
-
-    def isRotationMatrix(self, R):
-        # Checks if a matrix is a valid rotation matrix.
-        Rt = np.transpose(R)
-        shouldBeIdentity = np.dot(Rt, R)
-        I = np.identity(3, dtype = R.dtype)
-        n = np.linalg.norm(I - shouldBeIdentity)
-        return n < 1e-6
-
-
-    def rotationMatrixToEulerAngles(self, R):
-        # Calculates rotation matrix to euler angles
-        # The result is the same as MATLAB except the order
-        # of the euler angles ( x and z are swapped ).
-
-        assert(self.isRotationMatrix(R))
-
-        sy = sqrt(R[0,0] * R[0,0] +  R[1,0] * R[1,0])
-
-        singular = sy < 1e-6
-
-        if  not singular:
-            x = atan2(R[2,1] , R[2,2])
-            y = atan2(-R[2,0], sy)
-            z = atan2(R[1,0], R[0,0])
-        else:
-            x = atan2(-R[1,2], R[1,1])
-            y = atan2(-R[2,0], sy)
-            z = 0
-
-        return np.array([x, y, z])
